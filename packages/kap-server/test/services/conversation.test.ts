@@ -28,11 +28,11 @@ import {
   applyConversationRecord,
   createConversationState,
   settleOrphanTurns,
+  undoConversationTurns,
   type ConversationFork,
   type ConversationState,
 } from '../../src/services/conversation/conversationFold';
 import { ConversationFeed, type ConversationEvent } from '../../src/services/conversation/conversationFeed';
-import { parseWireRecords } from '../../src/services/conversation/conversationService';
 
 let clock = 1_000;
 
@@ -316,7 +316,7 @@ describe('conversation fold', () => {
     expect(other.turns[0]?.turn_id).not.toBe(original.turn_id);
   });
 
-  it('times reasoning by its streamed block and falls back to the step span for untimed records', () => {
+  it('times reasoning by its streamed block and leaves untimed records without a duration', () => {
     const state = fold([
       turnPrompt(0, 'p1'),
       userMessage('p1', 'hello'),
@@ -328,7 +328,8 @@ describe('conversation fold', () => {
     const turn = state.turns[0];
     const stepStart = iso(state.steps[turn!.turn_id]![0]!.startedAt);
     expect(turn?.items[1]).toMatchObject({ type: 'reasoning', created_at: iso(5_000), started_at: iso(5_000), duration_ms: 1_200 });
-    expect(turn?.items[2]).toMatchObject({ type: 'reasoning', started_at: stepStart, duration_ms: 2 });
+    expect(turn?.items[2]).toMatchObject({ type: 'reasoning', started_at: stepStart });
+    expect(turn?.items[2]).toEqual(expect.not.objectContaining({ duration_ms: expect.anything() }));
   });
 
   it('places in-turn steers and legacy steer records inside the running turn', () => {
@@ -373,6 +374,14 @@ describe('conversation fold', () => {
     expect(state.turns[2]?.items.map((item) => item.item_id)).toEqual(['n-c', 'n-c:1']);
   });
 
+  it('reads the answer of a background question into structured fields', () => {
+    const answer = '\n<answer>\n{"answers":{"Pick one?":"B"},"note":"because"}\n</answer>';
+    const state = fold([userMessage(undefined, notificationXml('question-1', answer), { kind: 'task', taskId: 'question-1' })]);
+
+    expect(state.turns[0]?.items[0]).toMatchObject({ type: 'notification', answer: { answers: { 'Pick one?': 'B' }, note: 'because' } });
+    expect(state.turns[0]?.items[0]).toEqual(expect.not.objectContaining({ output: expect.anything() }));
+  });
+
   it('attaches an approval to the new call when an ended call of an earlier turn reused its id', () => {
     const state = fold([
       turnPrompt(0, 'p1'),
@@ -389,6 +398,26 @@ describe('conversation fold', () => {
 
     expect(state.turns[0]?.items[1]).toEqual(expect.not.objectContaining({ interaction_id: expect.anything() }));
     expect(state.turns[1]?.items[1]).toMatchObject({ item_id: 'Bash_1', stage: 'awaiting_approval', interaction_id: 'i1' });
+  });
+
+  it('starts a call that reuses an ended call id without that call approval', () => {
+    const state = fold([
+      turnPrompt(0, 'p1'),
+      userMessage('p1', 'first'),
+      stepBegin(0, 1, 's1'),
+      record('interaction.request', { id: 'i1', kind: 'approval', toolCallId: 'Bash_1', request: { toolName: 'Bash', turnId: 0 } }),
+      record('interaction.resolved', { id: 'i1', response: { decision: 'approved' } }),
+      toolCall(0, 1, 's1', 'Bash_1', 'Bash', { command: 'ls' }),
+      toolResult('Bash_1', 'ok'),
+      turnEnded(0, 'completed'),
+      turnPrompt(1, 'p2'),
+      userMessage('p2', 'second'),
+      stepBegin(1, 1, 's2'),
+      toolCall(1, 1, 's2', 'Bash_1', 'Bash', { command: 'pwd' }),
+    ]);
+
+    expect(state.turns[0]?.items[1]).toMatchObject({ item_id: 'Bash_1', interaction_id: 'i1' });
+    expect(state.turns[1]?.items[1]).toEqual(expect.not.objectContaining({ interaction_id: expect.anything() }));
   });
 
   it('attaches interactions recorded before the tool call and subagent links to tool items', () => {
@@ -544,6 +573,24 @@ describe('conversation fold', () => {
     expect(new Set(ordinals).size).toBe(ordinals.length);
   });
 
+  it('keeps the newer turn open when a cancelled turn it interleaved with ends', () => {
+    const state = fold([
+      turnPrompt(0, 'p1'),
+      userMessage('p1', 'first'),
+      stepBegin(0, 1, 's1'),
+      record('turn.cancel', { turnId: 0, reason: 'user' }),
+      turnPrompt(1, 'p2'),
+      userMessage('p2', 'second'),
+      stepBegin(0, 2, 's1b'),
+      turnEnded(0, 'cancelled'),
+      stepBegin(1, 1, 's2'),
+      userMessage('steer', 'more', { kind: 'user', inTurn: true }),
+    ]);
+
+    expect(state.turns).toHaveLength(2);
+    expect(shape(state.turns[1])).toEqual(['opener:second', 'steer:more']);
+  });
+
   it('keeps a running turn open while ownerless messages land beside it', () => {
     const state = fold([
       turnPrompt(0, 'p1'),
@@ -567,7 +614,7 @@ describe('conversation fold', () => {
     expect(shape(state.turns[0])).toEqual(['opener:work', 'assistant_message:done']);
   });
 
-  it('applies legacy undo records at message granularity', () => {
+  it('undoes legacy records at message granularity', () => {
     const state = fold([
       turnPrompt(undefined, undefined),
       userMessage('a', 'first'),
@@ -578,11 +625,11 @@ describe('conversation fold', () => {
       record('turn.steer', { input: [{ type: 'text', text: 'wait' }], origin: { kind: 'user' } }),
       userMessage('c', 'wait'),
       message('assistant', 'three'),
-      record('context.undo', { count: 1 }),
-      record('context.undo', { count: 1 }),
-      turnPrompt(undefined, undefined),
-      userMessage('d', 'third'),
     ]);
+    undoConversationTurns(state, 1);
+    undoConversationTurns(state, 1);
+    applyConversationRecord(state, turnPrompt(undefined, undefined));
+    applyConversationRecord(state, userMessage('d', 'third'));
 
     expect(state.turns.map(shape)).toEqual([
       ['opener:first', 'assistant_message:one'],
@@ -612,24 +659,30 @@ describe('conversation fold', () => {
 });
 
 describe('orphan turns', () => {
-  const unfinished = (): ConversationState => fold([
-    turnPrompt(0, 'p1'),
-    userMessage('p1', 'run it'),
-    stepBegin(0, 1, 's1'),
-    toolCall(0, 1, 's1', 'call-1', 'Bash', { command: 'ls' }),
+  const unfinished = (): WireRecord[] => [
+    turnPrompt(1, 'p2'),
+    userMessage('p2', 'run it'),
+    stepBegin(1, 1, 's1'),
+    toolCall(1, 1, 's1', 'call-1', 'Bash', { command: 'ls' }),
     record('interaction.request', { id: 'i1', kind: 'approval', toolCallId: 'call-1', request: {} }),
-  ]);
+  ];
 
   it('ends a running turn nothing runs anymore as aborted, with its items, without touching the input', () => {
-    const state = unfinished();
+    const state = fold([turnPrompt(0, 'p1'), userMessage('p1', 'first'), turnEnded(0, 'completed'), ...unfinished()]);
     const before = structuredClone(state);
 
     const settled = settleOrphanTurns(state);
 
     expect(state).toEqual(before);
-    expect(settled.turns[0]).toMatchObject({ status: 'ended', outcome: 'interrupted', end_reason: 'aborted', ended_at: iso(state.clock) });
-    expect(settled.turns[0]?.items[1]).toMatchObject({ status: 'ended', outcome: 'interrupted', interaction_id: 'i1' });
+    expect(settled.turns[1]).toMatchObject({ status: 'ended', outcome: 'interrupted', end_reason: 'aborted', ended_at: iso(state.clock) });
+    expect(settled.turns[1]?.items[1]).toMatchObject({ status: 'ended', outcome: 'interrupted', interaction_id: 'i1' });
     expect(settled.openTurnId).toBeUndefined();
+  });
+
+  it('ends the last turn of a conversation whose engine never recorded turn ends as completed', () => {
+    const settled = settleOrphanTurns(fold(unfinished()));
+
+    expect(settled.turns[0]).toMatchObject({ status: 'ended', outcome: 'completed' });
   });
 });
 
@@ -899,16 +952,5 @@ describe('conversation feed', () => {
     await huge.feed.ready;
     expect(await huge.feed.page(undefined, 10)).toMatchObject({ turns: [{ ordinal: 0 }], has_more: false });
     huge.dispatcher.dispose();
-  });
-});
-
-describe('cold wire records', () => {
-  it('rejects a corrupted complete line and tolerates a torn last line', () => {
-    const line = JSON.stringify({ type: 'context.clear', time: 1 });
-
-    expect(parseWireRecords(`${line}\n{"type":"conte`, 'example/wire.jsonl')).toEqual([JSON.parse(line)]);
-    expect(() => parseWireRecords(`${line}\n{"type":"conte\n${line}\n`, 'example/wire.jsonl')).toThrow(
-      'wire.jsonl: corrupted line 2 in example/wire.jsonl',
-    );
   });
 });

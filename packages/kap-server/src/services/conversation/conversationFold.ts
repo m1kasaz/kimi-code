@@ -13,7 +13,6 @@ import type { ContentPart } from '@moonshot-ai/agent-core-v2/human/llm/message';
 import type { WireRecord } from '@moonshot-ai/agent-core-v2/wire/record';
 
 import type {
-  AgentRef,
   CompactionItem,
   ConversationItem,
   ConversationOutcome,
@@ -67,7 +66,6 @@ export interface ToolTrack {
   turnId?: string;
   interaction?: ToolInteraction;
   planDisplay?: unknown;
-  pendingAgentRefs?: AgentRef[];
 }
 
 type CompactionDetails = Pick<
@@ -103,6 +101,7 @@ export interface ConversationState {
   anchors: UndoAnchor[];
   implicitlyEnded: Record<string, true>;
   provisionalEnds: Record<string, TurnEnd>;
+  recordsTurnEnds: boolean;
   stepParts: Record<string, number>;
   compaction?: CompactionDetails;
 }
@@ -122,6 +121,7 @@ export function createConversationState(agentId: string, fork?: ConversationFork
     anchors: [],
     implicitlyEnded: {},
     provisionalEnds: {},
+    recordsTurnEnds: false,
     stepParts: {},
   };
 }
@@ -204,11 +204,6 @@ export function applyConversationRecord(state: ConversationState, record: WireRe
     case 'context.clear':
       clearConversation(state);
       return;
-    case 'context.undo': {
-      const count = numberField(record['count']);
-      if (count !== undefined && count > 0) undoConversationTurns(state, count);
-      return;
-    }
   }
 }
 
@@ -234,7 +229,7 @@ export function settleOrphanTurns(state: ConversationState, running: RunningWork
       if (track !== undefined) next.tools[item.item_id] = structuredClone(track);
     }
     next.turns[index] = settled;
-    endTurn(next, settled, { outcome: 'interrupted', reason: 'aborted' }, state.clock);
+    endTurn(next, settled, state.recordsTurnEnds ? { outcome: 'interrupted', reason: 'aborted' } : COMPLETED, state.clock);
   });
   return next;
 }
@@ -407,14 +402,13 @@ function applyLoopEvent(state: ConversationState, event: LoopRecordedEvent | und
       const turn = turnForNumber(state, numberField(event.turnId), time);
       const position = state.stepParts[event.stepUuid] ?? 0;
       state.stepParts[event.stepUuid] = position + 1;
-      const stepStart = findStep(state, event.stepUuid)?.step.startedAt;
-      const startedAt = event.startedAt ?? stepStart ?? time;
+      const startedAt = event.startedAt ?? findStep(state, event.stepUuid)?.step.startedAt ?? time;
       const item = contentItem(
         event.part,
         `${event.stepUuid}:${event.block ?? position}`,
         event.step,
         startedAt,
-        event.durationMs ?? elapsedMs(stepStart, time),
+        event.durationMs,
       );
       if (item !== undefined) upsertItem(turn, item);
       return;
@@ -493,6 +487,7 @@ function applyStepRetrying(state: ConversationState, record: WireRecord): void {
 }
 
 function applyTurnEnded(state: ConversationState, record: WireRecord, time: number): void {
+  state.recordsTurnEnds = true;
   const turnNumber = numberField(record['turnId']);
   if (turnNumber !== undefined && state.pendingPrompt?.turnNumber === turnNumber) state.pendingPrompt = undefined;
   const turn = findTurnByNumber(state, turnNumber) ?? unnumberedOpenTurn(state);
@@ -543,8 +538,7 @@ function applyInteractionRequest(state: ConversationState, record: WireRecord, t
   if (kind !== 'approval' && kind !== 'question' && kind !== 'user_tool') return;
   state.interactions[id] = toolCallId;
   const request = record['request'];
-  const track = toolTrack(state, toolCallId);
-  if (findToolCall(state, toolCallId)?.item.status === 'ended') delete track.turnId;
+  const track = callTrack(state, toolCallId);
   if (kind === 'approval' && findToolCall(state, toolCallId) === undefined) {
     openToolCallAwaitingApproval(state, toolCallId, request, time);
   }
@@ -578,16 +572,8 @@ function applySubagentSpawned(state: ConversationState, record: WireRecord): voi
   if (toolCallId === undefined || agentId === undefined) return;
   const ref = agentRefOf(agentId, numberField(record['swarmIndex']), stringField(record['taskId']));
   const found = findToolCall(state, toolCallId);
-  if (found !== undefined) {
-    found.item.agent_refs = withAgentRef(found.item.agent_refs, ref);
-    return;
-  }
-  const track = toolTrack(state, toolCallId);
-  track.pendingAgentRefs = withAgentRef(track.pendingAgentRefs, ref);
-}
-
-function withAgentRef(refs: readonly AgentRef[] | undefined, ref: AgentRef): AgentRef[] {
-  return [...(refs ?? []).filter((existing) => existing.agent_id !== ref.agent_id), ref];
+  if (found === undefined) return;
+  found.item.agent_refs = [...(found.item.agent_refs ?? []).filter((existing) => existing.agent_id !== agentId), ref];
 }
 
 function applyCompactionSummary(state: ConversationState, record: WireRecord, time: number): void {
@@ -710,7 +696,9 @@ function endTurn(state: ConversationState, turn: ConversationTurn, end: TurnEnd,
   turn.duration_ms = Math.max(0, time - Date.parse(turn.started_at));
   for (const item of turn.items) endItem(state, item, end.outcome, time);
   delete state.provisionalEnds[turn.turn_id];
-  if (state.openTurnId === turn.turn_id) state.openTurnId = undefined;
+  if (state.openTurnId === turn.turn_id) {
+    state.openTurnId = state.turns.findLast((candidate) => candidate.status === 'running')?.turn_id;
+  }
 }
 
 function endItem(state: ConversationState, item: ConversationItem, outcome: ConversationOutcome, time: number): void {
@@ -792,12 +780,13 @@ function findToolCall(state: ConversationState, toolCallId: string): { turn: Con
   return { turn, item };
 }
 
-function toolTrack(state: ConversationState, toolCallId: string): ToolTrack {
+function callTrack(state: ConversationState, toolCallId: string): ToolTrack {
+  if (findToolCall(state, toolCallId)?.item.status === 'ended') state.tools[toolCallId] = {};
   return (state.tools[toolCallId] ??= {});
 }
 
 function upsertToolCall(state: ConversationState, turn: ConversationTurn, fresh: ToolCallItem): void {
-  const track = toolTrack(state, fresh.item_id);
+  const track = callTrack(state, fresh.item_id);
   const existing = turn.items.find((candidate) => candidate.item_id === fresh.item_id);
   const previous = existing?.type === 'tool_call' ? existing : undefined;
   if (isPlanTool(fresh.name)) track.planDisplay = fresh.display ?? track.planDisplay;
@@ -806,9 +795,8 @@ function upsertToolCall(state: ConversationState, turn: ConversationTurn, fresh:
     created_at: previous?.created_at ?? fresh.created_at,
     started_at: previous?.started_at ?? fresh.started_at,
     display: fresh.display ?? previous?.display,
-    agent_refs: track.pendingAgentRefs ?? previous?.agent_refs,
+    agent_refs: previous?.agent_refs,
   };
-  delete track.pendingAgentRefs;
   track.turnId = turn.turn_id;
   refreshToolCall(item, track.interaction, track.planDisplay);
   upsertItem(turn, item);
@@ -876,10 +864,4 @@ function numberField(value: unknown): number | undefined {
 
 function stringField(value: unknown): string | undefined {
   return typeof value === 'string' && value.length > 0 ? value : undefined;
-}
-
-function elapsedMs(from: number | undefined, to: number): number | undefined {
-  if (from === undefined) return undefined;
-  const ms = to - from;
-  return Number.isFinite(ms) && ms >= 0 ? ms : undefined;
 }

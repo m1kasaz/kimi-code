@@ -1068,7 +1068,7 @@ schema 还接受 `agent_config` 内的 `system_prompt`、`tools`、`mcp_servers`
 | `session_id` | path | string | **必填。** 会话 id |
 | `content` | body | array | **必填。** 非空的内容块数组；变体见下 |
 | `agent_id` | body | string | 目标 Agent。默认为 main agent |
-| `prompt_id` | body | string | 客户端选定的提示词 id，用于幂等提交，带 `skills` 时同样可用；已被进行中提示词占用的 id 返回 `40927`，已完成的返回 `40903` |
+| `prompt_id` | body | string | 客户端选定的提示词 id，使提交幂等，带 `skills` 时同样可用：用同一个 id 再次发送同一个请求，会返回第一次提交的结果（第一次还在处理时等它完成），不会重复提交；同一个 id 用于不同的请求返回 `40927` |
 | `skills` | body | array | 打包的 Skill 激活，至少 1 个 `{ name, args? }` 条目；每个 Skill 必须存在且可由用户激活 |
 | `profile` | body | string | 提交前要绑定的 Agent 档案 |
 | `model` | body | string | 要切换到的模型别名 |
@@ -1096,9 +1096,8 @@ schema 还接受共享消息格式中的 `tool_use`、`tool_result` 和 `thinkin
 - `40401`：会话不存在
 - `40407`：引用的 `file_id` 不存在（或与内容块的媒体 kind 不匹配）
 - `40415`：某个 `skills` 条目指向未知的 Skill
-- `40903`：`prompt_id` 属于已完成的提示词；`data` 携带 `{ aborted: false }`
 - `40912`：Skill 存在但无法由用户激活
-- `40927`：`prompt_id` 已被进行中的提示词占用
+- `40927`：`prompt_id` 已被另一个请求使用
 
 #### `POST /api/v1/sessions/{session_id}/prompts:steer`
 
@@ -1294,7 +1293,7 @@ schema 还接受共享消息格式中的 `tool_use`、`tool_result` 和 `thinkin
 | `session_id` | path | string | **必填。** 会话 id |
 | `skill_name` | path | string | **必填。** 要激活的技能名 |
 | `args` | body | string | 传给技能的自由文本参数，相当于斜杠命令后的文本 |
-| `prompt_id` | body | string | 客户端选定的激活消息 id，会出现在对话中对应 `user_message` 条目的 `prompt_ids` 里 |
+| `prompt_id` | body | string | 客户端选定的激活消息 id，会出现在对话中对应 `user_message` 条目的 `prompt_ids` 里。和提交提示词一样，用同一个 id 再次发送同一个请求会返回第一次的结果，不会重复激活 |
 | `attachments` | body | array | 随激活携带的媒体块。`image` / `video` 块带 `source` 对象（`kind` 为 `url` / `base64` / `file` / `session_media`，与提示词内容块同形）；`file` 块带顶层 `file_id`、`name`、`media_type`、`size` |
 
 成功时 `data` 为 `{ activated: true, skill_name }`。
@@ -1304,7 +1303,7 @@ schema 还接受共享消息格式中的 `tool_use`、`tool_result` 和 `thinkin
 - `40407`：引用的附件文件不存在
 - `40415`：没有该名称的技能
 - `40912`：技能存在，但其类型不允许用户激活
-- `40927`：`prompt_id` 已被其他提示词占用
+- `40927`：`prompt_id` 已被另一个请求使用
 
 #### `GET /api/v1/tools`
 
@@ -2400,7 +2399,7 @@ locator 寻址的目录（脱敏配置），外加对每个 OAuth 候选的批�
 
 Agent 自身的状态由另外四种平铺帧同步，每帧都携带完整的值，客户端整份替换本地副本；和任务帧一样不回放。连接开始接收某个 agent 时（规则同 `task.list`），先收到当前的 `agent`、`usage`（该 agent 有模型上下文时）、`goal`（仅主 agent）与 `todo` 帧，之后每当某个值变化就再收到对应的帧；已列出、之后才加入会话的 agent 也会用这几种帧通告自己。订阅会话时如果主 agent 还不存在，服务端会先创建它，所以订阅之后总能收到主 agent 的这几种帧。四种帧都是 `{ type, session_id, agent_id, event_created_at, ... }`：
 
-- `agent`：`{ status: "idle" | "running" | "compacting", model?, thinking?, permission_mode?, plan_mode, swarm_mode, tower_mode }`。正在压缩该 agent 的上下文时 `status` 为 `compacting`，否则在 agent 处理某一轮时为 `running`、不处理时为 `idle`。正在运行的轮次以及模型请求失败后的重试状态随对话帧下发。三个模式字段都是布尔值。
+- `agent`：`{ status: "idle" | "running", compacting, model?, thinking?, permission_mode?, plan_mode, swarm_mode, tower_mode }`。agent 处理某一轮时 `status` 为 `running`，不处理时为 `idle`。正在压缩该 agent 的上下文时 `compacting` 为 `true`，无论是否在某一轮之中。正在运行的轮次以及模型请求失败后的重试状态随对话帧下发。`compacting` 和三个模式字段都是布尔值。
 - `usage`：`{ context_tokens, max_context_tokens? }`。只有最新值有意义，因此上下文增长期间服务端每秒最多发送几次。
 - `goal`：`{ goal? }`，会话没有目标时省略 `goal`，否则为 `{ objective, status: "active" | "paused" | "blocked" | "complete", completion_criterion?, turns_used, tokens_used, wall_clock_ms }`。
 - `todo`：`{ items: [{ title, status: "pending" | "in_progress" | "done" }] }`，取自 agent 的待办存储，因此会跟随撤销回退，重启后也能恢复。
@@ -2427,7 +2426,7 @@ Agent 自身的状态由另外四种平铺帧同步，每帧都携带完整的�
 - `assistant_message`：`{ text }`。
 - `reasoning`：`{ text, started_at, duration_ms? }`；`duration_ms` 是思考输出的时长，条目结束后才有。隐藏的思考不会下发。
 - `tool_call`：`{ item_id: 工具调用 id, name, stage?, input?, input_text?, display?, output?, media?, error?, progress?, interaction_id?, agent_refs?, started_at, ended_at? }`。调用运行时，模型流式生成参数期间 `stage` 为 `input`（`input_text` 为参数原文），等待审批时为 `awaiting_approval`，其余时候为 `executing`；`output` 流式追加工具的实时输出，`progress` 为 `{ percent?, status?, custom_kind?, custom_data? }`。结束后 `output` 为结果文本，`media` 列出结果中的图片、视频和音频，形如 `{ kind, file_id?, url?, media_type? }`；结果为错误时 `outcome` 为 `failed`，带 `error` 而不带 `output`；该轮在产生结果前结束时为 `interrupted`。`interaction_id` 关联为该调用发起的审批或提问，其内容随 `interaction` 帧下发；`agent_refs` 列出该调用启动的 subagent，形如 `{ agent_id, role: "child" | "member", swarm_index?, task_id? }`。`ExitPlanMode` 调用带 `display`：`{ kind: "plan_review", plan, path?, options: [{ label, description }], review: { state: "pending" | "approved" | "rejected" | "cancelled", selected_option?, feedback? } }`。
-- `notification`：`{ notification_id, title, body, severity: "info" | "warning" | "error", notification_type, source: { kind, id }, task_id?, agent_id?, output?: { file?, preview?, bytes?, truncated? } }`，投递进对话的后台任务通知。
+- `notification`：`{ notification_id, title, body, severity: "info" | "warning" | "error", notification_type, source: { kind, id }, task_id?, agent_id?, output?: { file?, preview?, bytes?, truncated? }, answer?: { answers, note? } }`，投递进对话的后台任务通知。`answer` 是用户对后台提问的回答：`answers` 把每个问题映射到它的回答，`note` 是可选的备注。
 - `system`：完成的上下文压缩为 `{ kind: "compaction", trigger: "manual" | "auto", instruction?, tokens_before?, tokens_after?, compacted_count?, summary? }`，在一轮运行中途完成的压缩放在该轮内；`{ kind: "fork_boundary", source: "btw" | "fork", forked_from: { agent_id } }` 位于从其他 agent 分叉出的 agent（例如侧边对话）的对话开头，分叉时继承的对话不显示。被取消或失败的压缩不在对话中留下任何内容。
 
 连接开始接收某个 agent 时，先收到 `{ type: "turns", session_id, agent_id, event_created_at, turns, has_more }`，携带最近 10 个轮次，与 REST 分页一样不超过 1 MiB，包括运行中的轮次及其到此刻为止的内容。该 agent 的对话无法加载时，改为收到 `{ type: "turns.failed", session_id, agent_id, event_created_at, code, msg }`——例如 agent 不在该会话中时为 `40401`，或 agent 关闭后被重新加载时恢复失败——该 agent 仍保持订阅。之后再收到的 `turns` 帧会替换客户端最新的这些轮次：撤销之后、清空上下文之后、以及 agent 关闭后被重新加载时都会再发一次。之后：

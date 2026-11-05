@@ -1068,7 +1068,7 @@ Submits a user prompt to the session. Media references are validated first, then
 | `session_id` | path | string | **Required.** Session id |
 | `content` | body | array | **Required.** Non-empty array of content parts; variants below |
 | `agent_id` | body | string | Target agent. Default the main agent |
-| `prompt_id` | body | string | Client-chosen prompt id for idempotent submission, also with `skills`; an id already reserved by an in-flight prompt fails `40927`, one that has already completed fails `40903` |
+| `prompt_id` | body | string | Client-chosen prompt id that makes the submission idempotent, also with `skills`: sending the same request again with the same id returns the result of the first submission, waiting for it while it is still being processed, and does not submit again; reusing the id for a different request fails `40927` |
 | `skills` | body | array | Bundled skill activations, at least 1 entry of `{ name, args? }`; every skill must exist and be user-activatable |
 | `profile` | body | string | Agent profile to bind before submitting |
 | `model` | body | string | Model alias to switch the agent to |
@@ -1096,9 +1096,8 @@ On success, `data` is the accepted prompt `{ prompt_id, user_message_id, status,
 - `40401`: session not found
 - `40407`: a referenced `file_id` does not exist (or does not match the part's media kind)
 - `40415`: a `skills` entry names an unknown skill
-- `40903`: `prompt_id` belongs to an already-completed prompt; `data` carries `{ aborted: false }`
 - `40912`: the skill exists but cannot be activated by the user
-- `40927`: `prompt_id` is already reserved by an in-flight prompt
+- `40927`: `prompt_id` is already used by a different request
 
 #### `POST /api/v1/sessions/{session_id}/prompts:steer`
 
@@ -1294,7 +1293,7 @@ Activates a skill in the session — the REST analogue of the `/<skill>` slash c
 | `session_id` | path | string | **Required.** Session id |
 | `skill_name` | path | string | **Required.** Name of the skill to activate |
 | `args` | body | string | Free-form arguments handed to the skill, like the text after a slash command |
-| `prompt_id` | body | string | Client-chosen id of the activation message; it shows up in the `prompt_ids` of the conversation's `user_message` item |
+| `prompt_id` | body | string | Client-chosen id of the activation message; it shows up in the `prompt_ids` of the conversation's `user_message` item. Like a prompt submission, sending the same request again with the same id returns the first result without activating again |
 | `attachments` | body | array | Media parts attached to the activation. Image and video parts carry a `source` object whose `kind` is `url` / `base64` / `file` / `session_media` (same shapes as the prompt content parts); file parts carry the top-level `file_id`, `name`, `media_type`, and `size` |
 
 On success, `data` is `{ activated: true, skill_name }`.
@@ -1304,7 +1303,7 @@ On success, `data` is `{ activated: true, skill_name }`.
 - `40407`: a referenced attachment file does not exist
 - `40415`: no skill with that name
 - `40912`: the skill exists but its type cannot be activated by the user
-- `40927`: `prompt_id` is already reserved by another prompt
+- `40927`: `prompt_id` is already used by a different request
 
 #### `GET /api/v1/tools`
 
@@ -2399,7 +2398,7 @@ Each agent's running tasks — shell commands in the foreground and background, 
 
 An agent's own state is synced by four more flat frames, each carrying the full value and replacing the client copy; like the task frames they are never replayed. When a connection starts receiving an agent (the same rule as `task.list`), it first gets the current `agent`, `usage` (when the agent has a model context), `goal` (main agent only), and `todo` frames, and after that each frame again whenever its value changes; a listed agent that joins the session later announces itself with the same frames. Subscribing to a session creates its main agent if it does not exist yet, so the main agent's frames always follow the subscription. All four are `{ type, session_id, agent_id, event_created_at, ... }`:
 
-- `agent`: `{ status: "idle" | "running" | "compacting", model?, thinking?, permission_mode?, plan_mode, swarm_mode, tower_mode }`. `status` is `compacting` while the agent's context is being compacted, otherwise `running` while the agent works on a turn and `idle` when it does not. The running turn, and the retry state of a failed model request, come with the conversation frames. The three mode fields are booleans.
+- `agent`: `{ status: "idle" | "running", compacting, model?, thinking?, permission_mode?, plan_mode, swarm_mode, tower_mode }`. `status` is `running` while the agent works on a turn and `idle` when it does not. `compacting` is `true` while the agent's context is being compacted, whether inside a turn or not. The running turn, and the retry state of a failed model request, come with the conversation frames. `compacting` and the three mode fields are booleans.
 - `usage`: `{ context_tokens, max_context_tokens? }`. Only the latest value matters, so while the context grows the server sends it at most a few times per second.
 - `goal`: `{ goal? }`, where `goal` is omitted when the session has none, or is `{ objective, status: "active" | "paused" | "blocked" | "complete", completion_criterion?, turns_used, tokens_used, wall_clock_ms }`.
 - `todo`: `{ items: [{ title, status: "pending" | "in_progress" | "done" }] }`, read from the agent's todo store, so it follows undo and survives a restart.
@@ -2426,7 +2425,7 @@ Every item has `{ item_id, type, step_index?, status, outcome?, created_at }`. I
 - `assistant_message`: `{ text }`.
 - `reasoning`: `{ text, started_at, duration_ms? }`; `duration_ms` is how long the reasoning streamed, present once the item has ended. Hidden reasoning is never sent.
 - `tool_call`: `{ item_id: tool call id, name, stage?, input?, input_text?, display?, output?, media?, error?, progress?, interaction_id?, agent_refs?, started_at, ended_at? }`. While the call runs, `stage` is `input` while the model streams the arguments (`input_text` holds them as text), `awaiting_approval` while its approval is pending, and `executing` otherwise; `output` streams the tool's live output and `progress` is `{ percent?, status?, custom_kind?, custom_data? }`. Once ended, `output` is the text of the result and `media` lists its images, videos, and audio as `{ kind, file_id?, url?, media_type? }`; the `outcome` is `failed`, with `error` instead of `output`, when the result is an error, and `interrupted` when the turn ended before a result. `interaction_id` links the approval or question raised for the call, whose content comes with the `interaction` frames, and `agent_refs` lists the subagents the call started as `{ agent_id, role: "child" | "member", swarm_index?, task_id? }`. `ExitPlanMode` calls carry the `display` `{ kind: "plan_review", plan, path?, options: [{ label, description }], review: { state: "pending" | "approved" | "rejected" | "cancelled", selected_option?, feedback? } }`.
-- `notification`: `{ notification_id, title, body, severity: "info" | "warning" | "error", notification_type, source: { kind, id }, task_id?, agent_id?, output?: { file?, preview?, bytes?, truncated? } }`, a background task notification delivered into the conversation.
+- `notification`: `{ notification_id, title, body, severity: "info" | "warning" | "error", notification_type, source: { kind, id }, task_id?, agent_id?, output?: { file?, preview?, bytes?, truncated? }, answer?: { answers, note? } }`, a background task notification delivered into the conversation. `answer` is the user's reply to a background question: `answers` maps each question to its answer, and `note` is an optional note.
 - `system`: `{ kind: "compaction", trigger: "manual" | "auto", instruction?, tokens_before?, tokens_after?, compacted_count?, summary? }` for a completed context compaction, placed inside the running turn when it ran mid-turn; or `{ kind: "fork_boundary", source: "btw" | "fork", forked_from: { agent_id } }`, which opens the conversation of an agent forked from another one, such as a side chat, without showing the conversation it inherited. A compaction that is cancelled or fails leaves nothing in the conversation.
 
 When a connection starts receiving an agent it gets `{ type: "turns", session_id, agent_id, event_created_at, turns, has_more }` with the latest 10 turns, within 1 MiB like the REST pages, including the running turn and what it has produced so far. When the agent's conversation cannot be loaded, it gets `{ type: "turns.failed", session_id, agent_id, event_created_at, code, msg }` instead — for example `40401` for an agent that is not in the session, or when an agent loaded again after it was closed fails to restore — and the agent stays subscribed. A later `turns` frame replaces the client's latest turns: it is sent again after an undo, after a context clear, and when the agent is loaded again after it was closed. After that:
